@@ -29,14 +29,15 @@ Look in `bin\Release\net8.0-windows\win-x64\publish`.
 3. Filters videos and screen recordings heuristically by folder/file name; filename search and sort controls.
 4. Saves selected files to Windows with collision-safe names and a `.partial` staging file, tracking bytes reported during transfer.
 5. Checks transferred size when supplied by MTP and leaves phone originals untouched.
-6. Displays a visible indeterminate scan indicator and folder-by-folder scan status.
-7. Provides photo preview when a photo is selected, plus lazy photo thumbnails for visible file rows. Preview uses a temporary local cache and never downloads large video files automatically.
-8. Bundles a custom application icon for taskbar and Explorer.
+6. Displays media progressively while the device is scanning, updates the count after each small batch, and allows stopping the scan while keeping already-discovered files.
+7. Provides photo preview when a photo is selected, plus lazy photo thumbnails for visible file rows. Preview uses a temporary local cache.
+8. Video Play downloads the original file into the chosen Windows save folder first, then opens it in the in-app Windows MediaElement player. Large videos are **not** downloaded automatically; playback depends on codecs available in Windows.
+9. Bundles a custom application icon for taskbar and Explorer.
 
 ## Known limitations / next milestones
 
 - **Not yet hardware-tested:** requires Windows and a physical TECNO phone; builds and MTP API compatibility must be verified there.
-- Video previews are not yet implemented: select and save a recording, then open it from Windows. Large recordings are never automatically downloaded for preview.
+- Video thumbnails remain placeholder icons until a future thumbnail-extraction integration. Playing a video requires transferring the complete video to PC first; this can take time for 1–2 GB recordings.
 - Photo thumbnails load on demand while scrolling (limited to 12 MB photos); select a photo to load its larger preview.
 - Recording-folder naming differs across TECNO/HiOS versions: inspect actual folders and tune filter.
 - Transfer progress is based on the bytes the MTP library writes; some devices may report size inaccurately. Cancellation is not yet implemented.

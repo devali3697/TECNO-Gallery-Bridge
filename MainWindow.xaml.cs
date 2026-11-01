@@ -19,10 +19,14 @@ public partial class MainWindow : Window
     private string _filter = "All";
     private string _destination = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "TECNO Recordings");
     private bool _busy;
+    private bool _transferring;
     private readonly SemaphoreSlim _mtpGate = new(1, 1);
     private readonly string _previewCache = Path.Combine(Path.GetTempPath(), "TECNO-Gallery-Bridge-Previews");
     private int _previewRequest;
     private readonly HashSet<string> _thumbnailPending = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _savedVideos = new(StringComparer.Ordinal);
+    private bool _videoPaused;
+    private CancellationTokenSource? _scanCancellation;
 
     public MainWindow()
     {
@@ -38,58 +42,81 @@ public partial class MainWindow : Window
     {
         if (_busy) return;
         _busy = true;
+        _scanCancellation = new CancellationTokenSource();
+        StopScanButton.Visibility = Visibility.Visible;
         StatusText.Text = "Scanning MTP devices and media…";
         ScanProgress.Visibility = Visibility.Visible;
         TransferProgress.Visibility = Visibility.Collapsed;
         DeviceText.Text = "Connecting to Android phone…";
         try
         {
-            var scanUpdates = new Progress<(string folder, int count)>(state =>
+            _all.Clear();
+            _visible.Clear();
+            var scanUpdates = new Progress<(string folder, List<MediaItem> files)>(state =>
             {
-                StatusText.Text = $"Scanning {state.folder} — {state.count:N0} media found…";
+                _all.AddRange(state.files);
+                StatusText.Text = $"Scanning {state.folder} — {_all.Count:N0} media found (available now)…";
                 DeviceText.Text = "USB phone connected — indexing gallery…";
+                foreach (var item in state.files.Where(MatchesCurrentFilter)) InsertSorted(item);
+                CountText.Text = $"{_visible.Count:N0} items";
             });
-            // MTP operations run off the UI thread to keep the gallery responsive.
-            var result = await Task.Run(() =>
+            var device = await Task.Run(() =>
             {
                 _device?.Dispose();
-                var device = MediaDevice.GetDevices().FirstOrDefault();
-                if (device == null) return (device: (MediaDevice?)null, files: new List<MediaItem>());
-                device.Connect();
-                var files = new List<MediaItem>();
-                // Some phones expose media under different internal-storage folder names.
-                foreach (var root in device.GetDirectories("\\"))
-                    Scan(device, root, files, 0, scanUpdates);
-                return (device, files);
+                var found = MediaDevice.GetDevices().FirstOrDefault();
+                found?.Connect();
+                return found;
             });
-            _device = result.device;
-            _all = result.files;
+            _device = device;
             DeviceText.Text = _device == null ? "No MTP phone found. Unlock your phone and select File Transfer." : $"Connected: {_device.FriendlyName}";
-            StatusText.Text = _device == null ? "Waiting for phone" : $"Found {_all.Count:N0} media files. Choose a file to save.";
-            ApplyFilter();
+            if (_device != null)
+            {
+                await Task.Run(() =>
+                {
+                    string[] roots;
+                    _mtpGate.Wait();
+                    try { roots = _device.GetDirectories("\\").ToArray(); }
+                    finally { _mtpGate.Release(); }
+                    foreach (var root in roots)
+                    {
+                        if (_scanCancellation.IsCancellationRequested) break;
+                        Scan(_device, root, 0, scanUpdates, _mtpGate, _scanCancellation.Token);
+                    }
+                });
+            }
+            StatusText.Text = _device == null ? "Waiting for phone" : $"Scan finished or stopped. {_all.Count:N0} media files available.";
         }
         catch (Exception ex) { StatusText.Text = $"Could not scan phone: {ex.Message}"; }
-        finally { _busy = false; ScanProgress.Visibility = Visibility.Collapsed; TransferProgress.Visibility = Visibility.Visible; }
-        // Rebuild visible rows after scanning so the lazy thumbnail handlers can run.
-        if (_device != null)
+        finally
         {
-            MediaList.ItemsSource = null;
-            MediaList.ItemsSource = _visible;
+            _busy = false;
+            StopScanButton.Visibility = Visibility.Collapsed;
+            ScanProgress.Visibility = Visibility.Collapsed;
+            TransferProgress.Visibility = Visibility.Visible;
         }
     }
 
-    private static void Scan(MediaDevice device, string folder, List<MediaItem> items, int depth,
-        IProgress<(string folder, int count)> progress)
+    private void StopScan_Click(object sender, RoutedEventArgs e)
     {
-        if (depth > 15) return;
+        _scanCancellation?.Cancel();
+        StatusText.Text = "Stopping scan after the current folder… files already found remain available.";
+    }
+
+    private static void Scan(MediaDevice device, string folder, int depth,
+        IProgress<(string folder, List<MediaItem> files)> progress, SemaphoreSlim gate, CancellationToken cancellationToken)
+    {
+        if (depth > 15 || cancellationToken.IsCancellationRequested) return;
         var normalized = folder.Replace('/', '\\');
         if (normalized.Contains("\\Android\\data", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("\\Android\\obb", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("\\.thumbnails", StringComparison.OrdinalIgnoreCase)) return;
+        var batch = new List<MediaItem>();
+        gate.Wait();
         try
         {
             foreach (var file in device.GetFiles(folder))
             {
+                if (cancellationToken.IsCancellationRequested) break;
                 try
                 {
                     var extension = Path.GetExtension(file).ToLowerInvariant();
@@ -103,23 +130,36 @@ public partial class MainWindow : Window
                         modified = info.LastWriteTime ?? DateTime.MinValue;
                     }
                     catch { /* Some TECNO video entries omit metadata but remain downloadable. */ }
-                    items.Add(new MediaItem(Path.GetFileName(file), file, folder, size, modified));
+                    batch.Add(new MediaItem(Path.GetFileName(file), file, folder, size, modified));
+                    if (batch.Count >= 25)
+                    {
+                        progress.Report((Path.GetFileName(folder.TrimEnd('\\')), batch.ToList()));
+                        batch.Clear();
+                    }
                 }
                 catch { /* Skip only the unreadable item, not the entire media folder. */ }
             }
         }
         catch { /* Continue into accessible subfolders even when this one cannot list files. */ }
-        progress.Report((Path.GetFileName(folder.TrimEnd('\\')), items.Count));
+        finally { gate.Release(); }
+        progress.Report((Path.GetFileName(folder.TrimEnd('\\')), batch.ToList()));
+        gate.Wait();
+        string[] subfolders;
         try
         {
-            var subfolders = device.GetDirectories(folder).OrderBy(path =>
+            subfolders = device.GetDirectories(folder).OrderBy(path =>
             {
                 var name = Path.GetFileName(path).ToLowerInvariant();
                 return name.Contains("screen") ? 0 : name is "movies" or "video" or "videos" ? 1 : name == "dcim" ? 2 : name == "pictures" ? 3 : 4;
             }).ToArray();
-            foreach (var subfolder in subfolders) Scan(device, subfolder, items, depth + 1, progress);
         }
-        catch { /* Some Android directories are inaccessible over MTP. */ }
+        catch { subfolders = Array.Empty<string>(); }
+        finally { gate.Release(); }
+        foreach (var subfolder in subfolders)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            Scan(device, subfolder, depth + 1, progress, gate, cancellationToken);
+        }
     }
 
     private async void Media_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -134,11 +174,15 @@ public partial class MainWindow : Window
         PreviewName.Text = item.Name;
         PreviewDetails.Text = $"{item.SizeLabel}  •  {item.Folder}";
         PreviewImage.Source = null;
+        VideoPlayer.Stop();
+        VideoPlayer.Visibility = Visibility.Collapsed;
+        PauseButton.Visibility = Visibility.Collapsed;
+        PlayButton.Visibility = item.IsVideo ? Visibility.Visible : Visibility.Collapsed;
         PreviewPlaceholder.Visibility = Visibility.Visible;
         PreviewLoading.Visibility = Visibility.Collapsed;
         if (item.IsVideo)
         {
-            PreviewPlaceholder.Text = "Video selected. Save to PC to play the original recording.";
+            PreviewPlaceholder.Text = "Video ready. Click Play to save it to PC first, then watch here.";
             return;
         }
         PreviewPlaceholder.Text = "Loading photo preview…";
@@ -161,7 +205,7 @@ public partial class MainWindow : Window
     private async void Thumbnail_Loaded(object sender, RoutedEventArgs e)
     {
         if (sender is not System.Windows.Controls.Image { DataContext: MediaItem item }) return;
-        if (_busy || _device == null || item.IsVideo || item.Thumbnail != null ||
+        if (_device == null || item.IsVideo || item.Thumbnail != null ||
             item.Bytes > 12 * 1024 * 1024 || !_thumbnailPending.Add(item.FullPath)) return;
         try { item.Thumbnail = await GetPhotoBitmapAsync(item, 140); }
         catch { /* Unsupported or unreadable formats retain a placeholder. */ }
@@ -206,6 +250,66 @@ public partial class MainWindow : Window
         Process.Start(new ProcessStartInfo { FileName = _destination, UseShellExecute = true });
     }
 
+    private async void Play_Click(object sender, RoutedEventArgs e)
+    {
+        if (MediaList.SelectedItem is not MediaItem item || !item.IsVideo || _device == null || _transferring) return;
+        try
+        {
+            if (!_savedVideos.TryGetValue(item.FullPath, out var savedPath) || !File.Exists(savedPath))
+            {
+                _transferring = true;
+                PlayButton.IsEnabled = false;
+                TransferProgress.Visibility = Visibility.Visible;
+                Directory.CreateDirectory(_destination);
+                savedPath = UniquePath(_destination, item.Name);
+                StatusText.Text = $"Downloading video to play: {item.Name}…";
+                var progress = new Progress<double>(value => TransferProgress.Value = value * 100);
+                await DownloadMediaAsync(item, savedPath, progress);
+                _savedVideos[item.FullPath] = savedPath;
+                StatusText.Text = $"Saved to PC and ready to play: {item.Name}";
+            }
+            VideoPlayer.Source = new Uri(savedPath, UriKind.Absolute);
+            VideoPlayer.Visibility = Visibility.Visible;
+            PreviewPlaceholder.Visibility = Visibility.Collapsed;
+            PauseButton.Visibility = Visibility.Visible;
+            _videoPaused = false;
+            VideoPlayer.Play();
+        }
+        catch (Exception ex) { StatusText.Text = $"Video unavailable: {ex.Message}"; }
+        finally { _transferring = false; PlayButton.IsEnabled = true; }
+    }
+
+    private void Pause_Click(object sender, RoutedEventArgs e)
+    {
+        if (_videoPaused) VideoPlayer.Play(); else VideoPlayer.Pause();
+        _videoPaused = !_videoPaused;
+    }
+
+    private void Video_Failed(object sender, ExceptionRoutedEventArgs e)
+    {
+        StatusText.Text = $"Video saved, but Windows player cannot decode it: {e.ErrorException.Message}";
+    }
+
+    private async Task DownloadMediaAsync(MediaItem file, string target, IProgress<double> progress)
+    {
+        var temporary = target + ".partial";
+        await _mtpGate.WaitAsync();
+        try
+        {
+            await Task.Run(() =>
+            {
+                using var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                using var tracked = new ProgressWriteStream(output, file.Bytes, progress);
+                _device!.DownloadFile(file.FullPath, tracked);
+                output.Flush(true);
+                if (file.Bytes > 0 && output.Length != file.Bytes)
+                    throw new IOException($"Size mismatch: expected {file.Bytes}, received {output.Length}");
+            });
+            File.Move(temporary, target);
+        }
+        finally { _mtpGate.Release(); }
+    }
+
     private void Filter_Click(object sender, RoutedEventArgs e)
     {
         _filter = (string)((System.Windows.Controls.Button)sender).Tag;
@@ -224,13 +328,7 @@ public partial class MainWindow : Window
 
     private void ApplyFilter()
     {
-        var selected = _all.Where(x => _filter switch
-        {
-            "Recordings" => x.IsVideo && (x.FullPath.Contains("screen", StringComparison.OrdinalIgnoreCase) || x.Name.Contains("record", StringComparison.OrdinalIgnoreCase)),
-            "Videos" => x.IsVideo,
-            "Photos" => !x.IsVideo,
-            _ => true
-        }).Where(x => string.IsNullOrWhiteSpace(SearchBox?.Text) || x.FullPath.Contains(SearchBox.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+        var selected = _all.Where(MatchesCurrentFilter);
         selected = (SortBox?.SelectedIndex ?? 0) switch
         {
             1 => selected.OrderByDescending(x => x.Bytes),
@@ -242,6 +340,28 @@ public partial class MainWindow : Window
         SectionText.Text = _filter == "Recordings" ? "Screen recordings" : _filter == "All" ? "All media" : _filter;
         CountText.Text = $"{_visible.Count:N0} items";
     }
+
+    private bool MatchesCurrentFilter(MediaItem x) => (_filter switch
+        {
+            "Recordings" => x.IsVideo && (x.FullPath.Contains("screen", StringComparison.OrdinalIgnoreCase) || x.Name.Contains("record", StringComparison.OrdinalIgnoreCase)),
+            "Videos" => x.IsVideo,
+            "Photos" => !x.IsVideo,
+            _ => true
+        }) && (string.IsNullOrWhiteSpace(SearchBox?.Text) || x.FullPath.Contains(SearchBox.Text.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private void InsertSorted(MediaItem item)
+    {
+        var index = 0;
+        while (index < _visible.Count && CompareItems(_visible[index], item) <= 0) index++;
+        _visible.Insert(index, item);
+    }
+
+    private int CompareItems(MediaItem a, MediaItem b) => (SortBox?.SelectedIndex ?? 0) switch
+    {
+        1 => b.Bytes.CompareTo(a.Bytes),
+        2 => StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name),
+        _ => b.ModifiedAt.CompareTo(a.ModifiedAt)
+    };
 
     private void ChooseFolder_Click(object sender, RoutedEventArgs e)
     {
@@ -256,10 +376,10 @@ public partial class MainWindow : Window
 
     private async void Save_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy || _device == null) return;
+        if (_transferring || _device == null) return;
         var files = MediaList.SelectedItems.Cast<MediaItem>().ToList();
         if (files.Count == 0) { StatusText.Text = "Select one or more media files first."; return; }
-        _busy = true;
+        _transferring = true;
         SaveButton.IsEnabled = false;
         TransferProgress.Visibility = Visibility.Visible;
         int completed = 0;
@@ -271,22 +391,10 @@ public partial class MainWindow : Window
                 StatusText.Text = $"Copying {file.Name} ({completed + 1}/{files.Count})…";
                 TransferProgress.Value = 100d * completed / files.Count;
                 var target = UniquePath(_destination, file.Name);
-                var temporary = target + ".partial";
                 try
                 {
                     var progress = new Progress<double>(fraction => TransferProgress.Value = 100d * (completed + fraction) / files.Count);
-                    await _mtpGate.WaitAsync();
-                    try { await Task.Run(() =>
-                    {
-                        using var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-                        using var tracked = new ProgressWriteStream(output, file.Bytes, progress);
-                        _device.DownloadFile(file.FullPath, tracked);
-                        output.Flush(true);
-                        if (file.Bytes > 0 && output.Length != file.Bytes)
-                            throw new IOException($"Size mismatch: expected {file.Bytes}, received {output.Length}");
-                    }); }
-                    finally { _mtpGate.Release(); }
-                    File.Move(temporary, target);
+                    await DownloadMediaAsync(file, target, progress);
                     completed++;
                 }
                 catch
@@ -299,7 +407,7 @@ public partial class MainWindow : Window
             StatusText.Text = $"Saved {completed} file(s) to {_destination}";
         }
         catch (Exception ex) { StatusText.Text = $"Transfer stopped after {completed} file(s): {ex.Message}"; }
-        finally { SaveButton.IsEnabled = true; _busy = false; }
+        finally { SaveButton.IsEnabled = true; _transferring = false; }
     }
 
     private static string UniquePath(string directory, string filename)
