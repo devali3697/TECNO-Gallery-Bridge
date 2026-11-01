@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -17,13 +18,14 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<MediaItem> _visible = new();
     private List<MediaItem> _all = new();
     private string _filter = "All";
-    private string _destination = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "TECNO Recordings");
+    private string _destination = LoadDestination();
     private bool _busy;
     private bool _transferring;
     private readonly SemaphoreSlim _mtpGate = new(1, 1);
-    private readonly string _previewCache = Path.Combine(Path.GetTempPath(), "TECNO-Gallery-Bridge-Previews");
+    private string _previewCache => Path.Combine(_destination, ".tecno-preview-cache");
     private int _previewRequest;
     private readonly HashSet<string> _thumbnailPending = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _thumbnailFailed = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _savedVideos = new(StringComparer.Ordinal);
     private CancellationTokenSource? _scanCancellation;
 
@@ -31,6 +33,9 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         MediaList.ItemsSource = _visible;
+        StatusText.Text = $"Save location: {_destination}";
+        SavePathText.Text = _destination;
+        SavePathText.ToolTip = _destination;
         Loaded += async (_, _) => await RefreshAsync();
         Closed += (_, _) =>
         {
@@ -201,14 +206,38 @@ public partial class MainWindow : Window
         finally { if (request == _previewRequest) PreviewLoading.Visibility = Visibility.Collapsed; }
     }
 
-    private async void Thumbnail_Loaded(object sender, RoutedEventArgs e)
+    private void Thumbnail_Loaded(object sender, RoutedEventArgs e)
     {
         if (sender is not System.Windows.Controls.Image { DataContext: MediaItem item }) return;
-        if (_device == null || item.IsVideo || item.Thumbnail != null || _thumbnailPending.Count >= 4 ||
-            item.Bytes > 6 * 1024 * 1024 || !_thumbnailPending.Add(item.FullPath)) return;
+        _ = LoadThumbnailAsync(item);
+    }
+
+    private async Task LoadThumbnailAsync(MediaItem item)
+    {
+        if (_device == null || item.IsVideo || item.Thumbnail != null || _thumbnailFailed.Contains(item.FullPath) ||
+            _thumbnailPending.Count >= 4 || item.Bytes > 6 * 1024 * 1024 ||
+            !_thumbnailPending.Add(item.FullPath)) return;
         try { item.Thumbnail = await GetPhotoBitmapAsync(item, 140); }
-        catch { /* Unsupported or unreadable formats retain a placeholder. */ }
-        finally { _thumbnailPending.Remove(item.FullPath); }
+        catch (Exception ex)
+        {
+            item.ThumbnailError = ex.Message;
+            _thumbnailFailed.Add(item.FullPath);
+        }
+        finally
+        {
+            _thumbnailPending.Remove(item.FullPath);
+            Dispatcher.BeginInvoke(new Action(QueueVisibleThumbnails), System.Windows.Threading.DispatcherPriority.Background);
+        }
+    }
+
+    private void QueueVisibleThumbnails()
+    {
+        if (_device == null) return;
+        foreach (var item in _visible)
+        {
+            if (_thumbnailPending.Count >= 4) break;
+            if (MediaList.ItemContainerGenerator.ContainerFromItem(item) != null) _ = LoadThumbnailAsync(item);
+        }
     }
 
     private async Task<BitmapImage> GetPhotoBitmapAsync(MediaItem item, int pixelWidth)
@@ -362,8 +391,45 @@ public partial class MainWindow : Window
             Title = "Choose where recordings will be saved",
             InitialDirectory = Directory.Exists(_destination) ? _destination : Environment.GetFolderPath(Environment.SpecialFolder.MyVideos)
         };
-        if (dialog.ShowDialog(this) == true) _destination = dialog.FolderName;
+        if (dialog.ShowDialog(this) == true)
+        {
+            _destination = dialog.FolderName;
+            SaveDestination(_destination);
+            SavePathText.Text = _destination;
+            SavePathText.ToolTip = _destination;
+        }
         StatusText.Text = $"Saving to {_destination}";
+    }
+
+    private static string SettingsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "TECNO Gallery Bridge", "settings.json");
+
+    private static string LoadDestination()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                var value = JsonSerializer.Deserialize<SaveSettings>(File.ReadAllText(SettingsPath));
+                if (!string.IsNullOrWhiteSpace(value?.SaveFolder) && Directory.Exists(value.SaveFolder))
+                    return value.SaveFolder;
+            }
+        }
+        catch { /* Fall back to a safe default if settings are missing or malformed. */ }
+        // The user's E: drive is preferred where it exists; they can choose any folder.
+        if (Directory.Exists(@"E:\")) return @"E:\TECNO Gallery Bridge";
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "TECNO Recordings");
+    }
+
+    private static void SaveDestination(string folder)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new SaveSettings(folder)));
+        }
+        catch { /* Non-persistent fallback: this session still uses the chosen folder. */ }
     }
 
     private async void Save_Click(object sender, RoutedEventArgs e)
@@ -415,6 +481,8 @@ public partial class MainWindow : Window
     }
 }
 
+public sealed record SaveSettings(string SaveFolder);
+
 public sealed class MediaItem : INotifyPropertyChanged
 {
     public MediaItem(string name, string fullPath, string folder, long bytes, DateTime modifiedAt)
@@ -430,6 +498,7 @@ public sealed class MediaItem : INotifyPropertyChanged
         get => _thumbnail;
         set { _thumbnail = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail))); }
     }
+    public string? ThumbnailError { get; set; }
     public event PropertyChangedEventHandler? PropertyChanged;
     public bool IsVideo => new[] { ".mp4", ".mkv", ".mov", ".3gp", ".avi", ".webm", ".3gpp" }.Contains(Path.GetExtension(Name).ToLowerInvariant());
     public string TypeIcon => IsVideo ? "▶" : "▧";
