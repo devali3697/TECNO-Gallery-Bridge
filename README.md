@@ -38,7 +38,7 @@ Look in `bin\Release\net8.0-windows\win-x64\publish`.
 ## Known limitations / next milestones
 
 - **Not yet hardware-tested:** requires Windows and a physical TECNO phone; builds and MTP API compatibility must be verified there.
-- Video thumbnails remain placeholder icons until a future thumbnail-extraction integration. Playing a video requires transferring the complete video to PC first; this can take time for 1–2 GB recordings.
+- Visible videos up to 15 MB are temporarily cached under the chosen save folder and sent to Windows Shell's thumbnail provider. Thumbnail extraction depends on the installed Windows codec/thumbnail handler; if Windows cannot provide one, the play icon remains. Videos larger than 15 MB are not automatically downloaded. When a large video is explicitly saved to PC, the app attempts to generate its thumbnail from that local file without re-downloading it.
 - No bundled video codec engine. This lightweight build relies on the user's installed Windows player. If a video cannot play, open the save folder and try a compatible player such as VLC installed separately.
 - Photo thumbnails load on demand while scrolling (limited to 6 MB photos and four outstanding requests); select a photo to load its larger preview. A failed photo thumbnail stores a tooltip error for diagnosis.
 - Recording-folder naming differs across TECNO/HiOS versions: inspect actual folders and tune filter.

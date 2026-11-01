@@ -9,6 +9,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using TECNO.GalleryBridge.Services;
 
 namespace TECNO.GalleryBridge;
 
@@ -214,10 +215,22 @@ public partial class MainWindow : Window
 
     private async Task LoadThumbnailAsync(MediaItem item)
     {
-        if (_device == null || item.IsVideo || item.Thumbnail != null || _thumbnailFailed.Contains(item.FullPath) ||
-            _thumbnailPending.Count >= 4 || item.Bytes > 6 * 1024 * 1024 ||
+        if (_device == null || item.Thumbnail != null || _thumbnailFailed.Contains(item.FullPath) ||
+            _thumbnailPending.Count >= 3 ||
+            (item.IsVideo ? item.Bytes <= 0 || item.Bytes > 15 * 1024 * 1024 : item.Bytes > 6 * 1024 * 1024) ||
             !_thumbnailPending.Add(item.FullPath)) return;
-        try { item.Thumbnail = await GetPhotoBitmapAsync(item, 140); }
+        try
+        {
+            var thumbnail = item.IsVideo
+                ? await GetVideoBitmapAsync(item)
+                : await GetPhotoBitmapAsync(item, 140);
+            if (thumbnail != null) item.Thumbnail = thumbnail;
+            else
+            {
+                item.ThumbnailError = "Windows did not return a video thumbnail for this format.";
+                _thumbnailFailed.Add(item.FullPath);
+            }
+        }
         catch (Exception ex)
         {
             item.ThumbnailError = ex.Message;
@@ -235,7 +248,7 @@ public partial class MainWindow : Window
         if (_device == null) return;
         foreach (var item in _visible)
         {
-            if (_thumbnailPending.Count >= 4) break;
+            if (_thumbnailPending.Count >= 3) break;
             if (MediaList.ItemContainerGenerator.ContainerFromItem(item) != null) _ = LoadThumbnailAsync(item);
         }
     }
@@ -272,6 +285,35 @@ public partial class MainWindow : Window
         return bitmap;
     }
 
+    private async Task<System.Windows.Media.Imaging.BitmapSource?> GetVideoBitmapAsync(MediaItem item)
+    {
+        if (_device == null) return null;
+        // Videos >15 MB, particularly 1–2 GB recordings, are never auto-downloaded for thumbnails.
+        if (item.Bytes <= 0 || item.Bytes > 15 * 1024 * 1024) return null;
+        var key = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+            item.FullPath + item.Bytes + item.ModifiedAt.Ticks)));
+        var videoPath = Path.Combine(_previewCache, key + Path.GetExtension(item.Name));
+        await _mtpGate.WaitAsync();
+        try
+        {
+            if (!File.Exists(videoPath))
+            {
+                Directory.CreateDirectory(_previewCache);
+                await Task.Run(() =>
+                {
+                    using var output = new FileStream(videoPath + ".partial", FileMode.Create, FileAccess.Write, FileShare.None);
+                    _device.DownloadFile(item.FullPath, output);
+                    output.Flush(true);
+                    if (item.Bytes > 0 && output.Length != item.Bytes)
+                        throw new IOException("Video thumbnail cache transfer was incomplete.");
+                });
+                File.Move(videoPath + ".partial", videoPath, true);
+            }
+        }
+        finally { _mtpGate.Release(); }
+        return await WindowsVideoThumbnail.TryCreateAsync(videoPath);
+    }
+
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
         Directory.CreateDirectory(_destination);
@@ -294,6 +336,7 @@ public partial class MainWindow : Window
                 var progress = new Progress<double>(value => TransferProgress.Value = value * 100);
                 await DownloadMediaAsync(item, savedPath, progress);
                 _savedVideos[item.FullPath] = savedPath;
+                _ = RefreshSavedVideoThumbnailAsync(item, savedPath);
                 StatusText.Text = $"Saved to PC and ready to play: {item.Name}";
             }
             if (!ReferenceEquals(MediaList.SelectedItem, item))
@@ -329,6 +372,16 @@ public partial class MainWindow : Window
             File.Move(temporary, target);
         }
         finally { _mtpGate.Release(); }
+    }
+
+    private async Task RefreshSavedVideoThumbnailAsync(MediaItem item, string localPath)
+    {
+        try
+        {
+            var thumbnail = await WindowsVideoThumbnail.TryCreateAsync(localPath);
+            if (thumbnail != null) item.Thumbnail = thumbnail;
+        }
+        catch { /* Thumbnail failure must never affect a completed file transfer. */ }
     }
 
     private void Filter_Click(object sender, RoutedEventArgs e)
@@ -453,6 +506,7 @@ public partial class MainWindow : Window
                 {
                     var progress = new Progress<double>(fraction => TransferProgress.Value = 100d * (completed + fraction) / files.Count);
                     await DownloadMediaAsync(file, target, progress);
+                    if (file.IsVideo) _ = RefreshSavedVideoThumbnailAsync(file, target);
                     completed++;
                 }
                 catch
