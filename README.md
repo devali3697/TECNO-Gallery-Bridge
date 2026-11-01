@@ -31,14 +31,14 @@ Look in `bin\Release\net8.0-windows\win-x64\publish`.
 5. Checks transferred size when supplied by MTP and leaves phone originals untouched.
 6. Displays media progressively while the device is scanning, updates the count after each small batch, and allows stopping the scan while keeping already-discovered files.
 7. Provides photo preview when a photo is selected, plus lazy photo thumbnails for visible file rows. Preview uses a temporary local cache.
-8. Video Play downloads the original file into the chosen Windows save folder first, then opens it in an embedded LibVLCSharp player (bundled VLC decoder). Large videos are **not** downloaded automatically. The Windows save folder is always available for external playback.
+8. Save & Open downloads the original video into the chosen Windows save folder, then launches the installed Windows default video player. Large videos are **not** downloaded automatically.
 9. Bundles a custom application icon for taskbar and Explorer.
 
 ## Known limitations / next milestones
 
 - **Not yet hardware-tested:** requires Windows and a physical TECNO phone; builds and MTP API compatibility must be verified there.
 - Video thumbnails remain placeholder icons until a future thumbnail-extraction integration. Playing a video requires transferring the complete video to PC first; this can take time for 1–2 GB recordings.
-- Video playback uses LibVLCSharp.WPF and VideoLAN.LibVLC.Windows (LGPL-licensed third-party components). Keep their license notices when redistributing the published application.
+- No bundled video codec engine. This lightweight build relies on the user's installed Windows player. If a video cannot play, open the save folder and try a compatible player such as VLC installed separately.
 - Photo thumbnails load on demand while scrolling (limited to 12 MB photos); select a photo to load its larger preview.
 - Recording-folder naming differs across TECNO/HiOS versions: inspect actual folders and tune filter.
 - Transfer progress is based on the bytes the MTP library writes; some devices may report size inaccurately. Cancellation is not yet implemented.

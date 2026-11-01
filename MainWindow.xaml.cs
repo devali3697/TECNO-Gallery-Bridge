@@ -1,5 +1,4 @@
 using MediaDevices;
-using LibVLCSharp.Shared;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -26,9 +25,6 @@ public partial class MainWindow : Window
     private int _previewRequest;
     private readonly HashSet<string> _thumbnailPending = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _savedVideos = new(StringComparer.Ordinal);
-    private bool _videoPaused;
-    private LibVLC? _libVlc;
-    private LibVLCSharp.Shared.MediaPlayer? _vlcPlayer;
     private CancellationTokenSource? _scanCancellation;
 
     public MainWindow()
@@ -38,9 +34,6 @@ public partial class MainWindow : Window
         Loaded += async (_, _) => await RefreshAsync();
         Closed += (_, _) =>
         {
-            _vlcPlayer?.Stop();
-            _vlcPlayer?.Dispose();
-            _libVlc?.Dispose();
             _device?.Dispose();
         };
     }
@@ -183,15 +176,12 @@ public partial class MainWindow : Window
         PreviewName.Text = item.Name;
         PreviewDetails.Text = $"{item.SizeLabel}  •  {item.Folder}";
         PreviewImage.Source = null;
-        _vlcPlayer?.Stop();
-        VideoPlayer.Visibility = Visibility.Collapsed;
-        PauseButton.Visibility = Visibility.Collapsed;
         PlayButton.Visibility = item.IsVideo ? Visibility.Visible : Visibility.Collapsed;
         PreviewPlaceholder.Visibility = Visibility.Visible;
         PreviewLoading.Visibility = Visibility.Collapsed;
         if (item.IsVideo)
         {
-            PreviewPlaceholder.Text = "Video ready. Click Play to save it to PC first, then watch here.";
+            PreviewPlaceholder.Text = "Video ready. Click Save & Open to launch your Windows video player.";
             return;
         }
         PreviewPlaceholder.Text = "Loading photo preview…";
@@ -214,8 +204,8 @@ public partial class MainWindow : Window
     private async void Thumbnail_Loaded(object sender, RoutedEventArgs e)
     {
         if (sender is not System.Windows.Controls.Image { DataContext: MediaItem item }) return;
-        if (_device == null || item.IsVideo || item.Thumbnail != null ||
-            item.Bytes > 12 * 1024 * 1024 || !_thumbnailPending.Add(item.FullPath)) return;
+        if (_device == null || item.IsVideo || item.Thumbnail != null || _thumbnailPending.Count >= 4 ||
+            item.Bytes > 6 * 1024 * 1024 || !_thumbnailPending.Add(item.FullPath)) return;
         try { item.Thumbnail = await GetPhotoBitmapAsync(item, 140); }
         catch { /* Unsupported or unreadable formats retain a placeholder. */ }
         finally { _thumbnailPending.Remove(item.FullPath); }
@@ -284,31 +274,13 @@ public partial class MainWindow : Window
             }
             if (!File.Exists(savedPath) || new FileInfo(savedPath).Length == 0)
                 throw new IOException($"Saved file is missing or empty: {savedPath}");
-            if (_libVlc == null)
-            {
-                Core.Initialize();
-                _libVlc = new LibVLC();
-                _vlcPlayer = new LibVLCSharp.Shared.MediaPlayer(_libVlc);
-                VideoPlayer.MediaPlayer = _vlcPlayer;
-            }
-            using var media = new Media(_libVlc, savedPath, FromType.FromPath);
-            VideoPlayer.Visibility = Visibility.Visible;
-            PreviewPlaceholder.Visibility = Visibility.Collapsed;
-            PauseButton.Visibility = Visibility.Visible;
-            _videoPaused = false;
-            if (!_vlcPlayer!.Play(media))
-                throw new IOException("VLC could not start playback. Use Open save folder to try your installed player.");
+            Process.Start(new ProcessStartInfo { FileName = savedPath, UseShellExecute = true });
+            StatusText.Text = $"Opened saved video in Windows player: {item.Name}";
         }
         catch (Exception ex) { StatusText.Text = $"Playback issue: {ex.Message}. Try Open save folder."; }
         finally { _transferring = false; PlayButton.IsEnabled = true; }
     }
 
-    private void Pause_Click(object sender, RoutedEventArgs e)
-    {
-        if (_vlcPlayer == null) return;
-        if (_videoPaused) _vlcPlayer.Play(); else _vlcPlayer.Pause();
-        _videoPaused = !_videoPaused;
-    }
 
     private async Task DownloadMediaAsync(MediaItem file, string target, IProgress<double> progress)
     {

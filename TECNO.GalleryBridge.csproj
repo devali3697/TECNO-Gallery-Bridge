@@ -10,8 +10,6 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="MediaDevices" Version="1.10.0" />
-    <PackageReference Include="LibVLCSharp.WPF" Version="3.10.2" />
-    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.24" />
     <Resource Include="Assets\app-icon.ico" />
   </ItemGroup>
 </Project>
