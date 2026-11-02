@@ -28,6 +28,7 @@ public partial class MainWindow : Window
     private readonly HashSet<string> _thumbnailPending = new(StringComparer.Ordinal);
     private readonly HashSet<string> _thumbnailFailed = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _savedVideos = new(StringComparer.Ordinal);
+    private Dictionary<string, List<LocalFile>> _localFiles = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _scanCancellation;
 
     public MainWindow()
@@ -37,7 +38,11 @@ public partial class MainWindow : Window
         StatusText.Text = $"Save location: {_destination}";
         SavePathText.Text = _destination;
         SavePathText.ToolTip = _destination;
-        Loaded += async (_, _) => await RefreshAsync();
+        Loaded += async (_, _) =>
+        {
+            await RefreshLocalIndexAsync();
+            await RefreshAsync();
+        };
         Closed += (_, _) =>
         {
             _device?.Dispose();
@@ -62,6 +67,7 @@ public partial class MainWindow : Window
             _visible.Clear();
             var scanUpdates = new Progress<(string folder, List<MediaItem> files)>(state =>
             {
+                foreach (var item in state.files) UpdateDownloadedState(item);
                 _all.AddRange(state.files);
                 StatusText.Text = $"Scanning {state.folder} — {_all.Count:N0} media found (available now)…";
                 DeviceText.Text = "USB phone connected — indexing gallery…";
@@ -180,7 +186,8 @@ public partial class MainWindow : Window
     {
         var request = ++_previewRequest;
         PreviewName.Text = item.Name;
-        PreviewDetails.Text = $"{item.SizeLabel}  •  {item.Folder}";
+        PreviewDetails.Text = $"{item.SizeLabel}  •  {item.Folder}" +
+            (item.DownloadedPath == null ? "" : $"\nAlready downloaded: {item.DownloadedPath}");
         PreviewImage.Source = null;
         PlayButton.Visibility = item.IsVideo ? Visibility.Visible : Visibility.Collapsed;
         PreviewPlaceholder.Visibility = Visibility.Visible;
@@ -288,6 +295,8 @@ public partial class MainWindow : Window
     private async Task<System.Windows.Media.Imaging.BitmapSource?> GetVideoBitmapAsync(MediaItem item)
     {
         if (_device == null) return null;
+        if (item.DownloadedPath is { } downloadedPath && File.Exists(downloadedPath))
+            return await WindowsVideoThumbnail.TryCreateAsync(downloadedPath);
         // Videos >15 MB, particularly 1–2 GB recordings, are never auto-downloaded for thumbnails.
         if (item.Bytes <= 0 || item.Bytes > 15 * 1024 * 1024) return null;
         var key = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
@@ -325,7 +334,10 @@ public partial class MainWindow : Window
         if (MediaList.SelectedItem is not MediaItem item || !item.IsVideo || _device == null || _transferring) return;
         try
         {
-            if (!_savedVideos.TryGetValue(item.FullPath, out var savedPath) || !File.Exists(savedPath))
+            var savedPath = item.DownloadedPath;
+            if (savedPath == null || !File.Exists(savedPath))
+                _savedVideos.TryGetValue(item.FullPath, out savedPath);
+            if (savedPath == null || !File.Exists(savedPath))
             {
                 _transferring = true;
                 PlayButton.IsEnabled = false;
@@ -336,6 +348,8 @@ public partial class MainWindow : Window
                 var progress = new Progress<double>(value => TransferProgress.Value = value * 100);
                 await DownloadMediaAsync(item, savedPath, progress);
                 _savedVideos[item.FullPath] = savedPath;
+                item.DownloadedPath = savedPath;
+                AddLocalFile(savedPath);
                 _ = RefreshSavedVideoThumbnailAsync(item, savedPath);
                 StatusText.Text = $"Saved to PC and ready to play: {item.Name}";
             }
@@ -437,7 +451,7 @@ public partial class MainWindow : Window
         _ => b.ModifiedAt.CompareTo(a.ModifiedAt)
     };
 
-    private void ChooseFolder_Click(object sender, RoutedEventArgs e)
+    private async void ChooseFolder_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new Microsoft.Win32.OpenFolderDialog
         {
@@ -447,11 +461,64 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) == true)
         {
             _destination = dialog.FolderName;
+            _savedVideos.Clear();
             SaveDestination(_destination);
             SavePathText.Text = _destination;
             SavePathText.ToolTip = _destination;
+            await RefreshLocalIndexAsync();
         }
         StatusText.Text = $"Saving to {_destination}";
+    }
+
+    private async Task RefreshLocalIndexAsync()
+    {
+        var folder = _destination;
+        var index = await Task.Run(() =>
+        {
+            var result = new Dictionary<string, List<LocalFile>>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (!Directory.Exists(folder)) return result;
+                foreach (var path in Directory.EnumerateFiles(folder, "*", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        if (path.EndsWith(".partial", StringComparison.OrdinalIgnoreCase)) continue;
+                        var info = new FileInfo(path);
+                        if (!result.TryGetValue(info.Name, out var matches))
+                            result[info.Name] = matches = new List<LocalFile>();
+                        matches.Add(new LocalFile(path, info.Length));
+                    }
+                    catch { /* Skip inaccessible local files. */ }
+                }
+            }
+            catch { /* Folder may be disconnected or unavailable. */ }
+            return result;
+        });
+        if (!string.Equals(folder, _destination, StringComparison.OrdinalIgnoreCase)) return;
+        _localFiles = index;
+        foreach (var item in _all) UpdateDownloadedState(item);
+    }
+
+    private void UpdateDownloadedState(MediaItem item)
+    {
+        // Matching filename AND exact byte size avoids most false 'downloaded' results.
+        // If MTP reports size 0/unknown we deliberately do not claim a verified match.
+        if (item.Bytes <= 0 || !_localFiles.TryGetValue(item.Name, out var matches))
+        {
+            item.DownloadedPath = null;
+            return;
+        }
+        item.DownloadedPath = matches.FirstOrDefault(file => file.Size == item.Bytes && File.Exists(file.Path))?.Path;
+    }
+
+    private void AddLocalFile(string path)
+    {
+        var info = new FileInfo(path);
+        if (!_localFiles.TryGetValue(info.Name, out var matches))
+            _localFiles[info.Name] = matches = new List<LocalFile>();
+        matches.RemoveAll(file => string.Equals(file.Path, path, StringComparison.OrdinalIgnoreCase));
+        matches.Add(new LocalFile(path, info.Length));
     }
 
     private static string SettingsPath => Path.Combine(
@@ -494,11 +561,19 @@ public partial class MainWindow : Window
         SaveButton.IsEnabled = false;
         TransferProgress.Visibility = Visibility.Visible;
         int completed = 0;
+        int skipped = 0;
         try
         {
             Directory.CreateDirectory(_destination);
             foreach (var file in files)
             {
+                if (file.DownloadedPath is { } existingPath && File.Exists(existingPath))
+                {
+                    completed++;
+                    skipped++;
+                    TransferProgress.Value = 100d * completed / files.Count;
+                    continue;
+                }
                 StatusText.Text = $"Copying {file.Name} ({completed + 1}/{files.Count})…";
                 TransferProgress.Value = 100d * completed / files.Count;
                 var target = UniquePath(_destination, file.Name);
@@ -506,6 +581,9 @@ public partial class MainWindow : Window
                 {
                     var progress = new Progress<double>(fraction => TransferProgress.Value = 100d * (completed + fraction) / files.Count);
                     await DownloadMediaAsync(file, target, progress);
+                    file.DownloadedPath = target;
+                    AddLocalFile(target);
+                    if (file.IsVideo) _savedVideos[file.FullPath] = target;
                     if (file.IsVideo) _ = RefreshSavedVideoThumbnailAsync(file, target);
                     completed++;
                 }
@@ -516,7 +594,7 @@ public partial class MainWindow : Window
                 }
             }
             TransferProgress.Value = 100;
-            StatusText.Text = $"Saved {completed} file(s) to {_destination}";
+            StatusText.Text = $"Saved {completed - skipped} new file(s); skipped {skipped} already downloaded. Folder: {_destination}";
         }
         catch (Exception ex) { StatusText.Text = $"Transfer stopped after {completed} file(s): {ex.Message}"; }
         finally { SaveButton.IsEnabled = true; _transferring = false; }
@@ -536,6 +614,7 @@ public partial class MainWindow : Window
 }
 
 public sealed record SaveSettings(string SaveFolder);
+public sealed record LocalFile(string Path, long Size);
 
 public sealed class MediaItem : INotifyPropertyChanged
 {
@@ -546,6 +625,19 @@ public sealed class MediaItem : INotifyPropertyChanged
     public string Folder { get; }
     public long Bytes { get; }
     public DateTime ModifiedAt { get; }
+    private string? _downloadedPath;
+    public string? DownloadedPath
+    {
+        get => _downloadedPath;
+        set
+        {
+            if (_downloadedPath == value) return;
+            _downloadedPath = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DownloadedPath)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DownloadedLabel)));
+        }
+    }
+    public string DownloadedLabel => DownloadedPath == null ? "" : "✓ Already downloaded";
     private ImageSource? _thumbnail;
     public ImageSource? Thumbnail
     {

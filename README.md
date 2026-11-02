@@ -34,6 +34,7 @@ Look in `bin\Release\net8.0-windows\win-x64\publish`.
 8. Save & Open downloads the original video into the chosen Windows save folder, then launches the installed Windows default video player. Large videos are **not** downloaded automatically.
 9. Bundles a custom application icon for taskbar and Explorer.
 10. Remembers the selected Windows save folder between launches. On systems with an E: drive and no saved preference, defaults to `E:\TECNO Gallery Bridge`; otherwise uses the user's Videos folder. Temporary photo previews are stored under `.tecno-preview-cache` in the chosen save folder rather than the C: temporary directory.
+11. Indexes existing files directly inside the selected save folder. A phone media item with the same filename and exact byte size displays a green **Already downloaded** label, and Save skips it rather than writing another copy. Changing the save folder rebuilds the local index. If MTP reports an unknown/zero size, the app does not claim a verified duplicate. Matches are metadata-based, not cryptographic hashes.
 
 ## Known limitations / next milestones
 
