@@ -1,4 +1,6 @@
 name: Build Windows EXE
+permissions:
+  contents: write
 on:
   workflow_dispatch:
   push:
@@ -17,3 +19,13 @@ jobs:
         with:
           name: TECNO-Gallery-Bridge-win-x64
           path: publish/
+      - name: Package ready-to-run Windows ZIP
+        shell: pwsh
+        run: Compress-Archive -Path publish/* -DestinationPath TECNO-Gallery-Bridge-Windows-x64.zip -Force
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.1.${{ github.run_number }}"
+          gh release create $tag ./TECNO-Gallery-Bridge-Windows-x64.zip ./publish/TECNO.GalleryBridge.exe --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "TECNO Gallery Bridge $tag (Windows 10/11)" --notes "Windows x64 self-contained release. Download the ZIP, extract it, and run TECNO.GalleryBridge.exe. Source code is in the same repository at the release tag." --latest
